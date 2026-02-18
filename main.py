@@ -53,7 +53,7 @@ def evict_if_needed():
         exact_cache.popitem(last=False)
 
 def fake_llm(query):
-    time.sleep(0.5)
+    time.sleep(2)
     return "Code review: Consider improving variable naming, adding error handling, and writing unit tests."
 
 def check_low_hit_rate():
