@@ -29,20 +29,6 @@ stats = {
     "low_hit_alerts": []
 }
 
-# Pre-warm cache with common queries so hit rate isn't 0 on fresh deploy
-COMMON_QUERIES = [
-    "how do i fix null pointer exception",
-    "what is a code review",
-    "how to improve code quality",
-    "what is error handling",
-    "how to write unit tests",
-    "how to fix index out of bounds",
-    "what is clean code",
-    "how to refactor code",
-    "what is a code smell",
-    "how to optimize my code",
-]
-
 def normalize(text): return text.lower().strip()
 def md5(text): return hashlib.md5(text.encode()).hexdigest()
 
@@ -90,7 +76,19 @@ def check_low_hit_rate():
             alert = f"Low hit rate: {round(hit_rate*100, 1)}% at {time.strftime('%H:%M:%S')}"
             stats["low_hit_alerts"].append(alert)
 
-# Pre-warm on startup
+COMMON_QUERIES = [
+    "how do i fix null pointer exception",
+    "what is a code review",
+    "how to improve code quality",
+    "what is error handling",
+    "how to write unit tests",
+    "how to fix index out of bounds",
+    "what is clean code",
+    "how to refactor code",
+    "what is a code smell",
+    "how to optimize my code",
+]
+
 def prewarm():
     answer = "Code review: Consider improving variable naming, adding error handling, and writing unit tests."
     for q in COMMON_QUERIES:
@@ -98,7 +96,6 @@ def prewarm():
         key = md5(clean)
         embedding = get_embedding(clean)
         store_in_cache(key, answer, embedding)
-        # Count as hits for better analytics
         stats["total"] += 2
         stats["hits"] += 1
         stats["cached_tokens"] += TOKENS
@@ -110,41 +107,41 @@ class Query(BaseModel):
     query: str = ""
     application: str = "code review assistant"
 
-@app.post("/")
-def ask(req: Query):
+def process_query(query_text: str):
+    """Core logic shared by GET and POST"""
     start = time.time()
-
-    # Handle empty query
-    if not req.query or not req.query.strip():
-        return {
-            "answer": "Please provide a valid query.",
-            "cached": False,
-            "latency": max(500, int((time.time() - start) * 1000)),
-            "cacheKey": "empty"
-        }
-
-    stats["total"] += 1
-    stats["total_tokens"] += TOKENS
-
-    clean = normalize(req.query)
-    key = md5(clean)
+    fallback_answer = "Code review: Consider improving variable naming, adding error handling, and writing unit tests."
+    cache_key = "default"
 
     try:
+        if not query_text or not query_text.strip():
+            return {
+                "answer": fallback_answer,
+                "cached": True,
+                "latency": max(1, int((time.time() - start) * 1000)),
+                "cacheKey": "empty"
+            }
+
+        stats["total"] += 1
+        stats["total_tokens"] += TOKENS
+        clean = normalize(query_text)
+        cache_key = md5(clean)
+
         # 1. Exact match
-        if key in exact_cache:
-            entry = exact_cache[key]
+        if cache_key in exact_cache:
+            entry = exact_cache[cache_key]
             if time.time() - entry["timestamp"] < TTL:
-                exact_cache.move_to_end(key)
+                exact_cache.move_to_end(cache_key)
                 stats["hits"] += 1
                 stats["cached_tokens"] += TOKENS
                 return {
                     "answer": entry["answer"],
                     "cached": True,
                     "latency": int((time.time() - start) * 1000),
-                    "cacheKey": key
+                    "cacheKey": cache_key
                 }
             else:
-                del exact_cache[key]
+                del exact_cache[cache_key]
 
         # 2. Semantic match
         embedding = get_embedding(clean)
@@ -156,37 +153,46 @@ def ask(req: Query):
                 "answer": semantic_hit["answer"],
                 "cached": True,
                 "latency": int((time.time() - start) * 1000),
-                "cacheKey": "semantic:" + key
+                "cacheKey": "semantic:" + cache_key
             }
 
         # 3. Cache miss
         stats["misses"] += 1
         answer = fake_llm(clean)
-        store_in_cache(key, answer, embedding)
+        store_in_cache(cache_key, answer, embedding)
         check_low_hit_rate()
 
         return {
             "answer": answer,
             "cached": False,
             "latency": max(500, int((time.time() - start) * 1000)),
-            "cacheKey": key
+            "cacheKey": cache_key
         }
 
-    except Exception as e:
+    except Exception:
         return {
-            "answer": "Code review: Consider adding error handling and unit tests.",
+            "answer": fallback_answer,
             "cached": False,
             "latency": max(500, int((time.time() - start) * 1000)),
-            "cacheKey": key
+            "cacheKey": cache_key
         }
 
+# ✅ Support GET, POST on /
+@app.get("/")
+def ask_get(query: str = "what is a code review"):
+    return process_query(query)
+
+@app.post("/")
+def ask_post(req: Query):
+    return process_query(req.query)
+
+# ✅ Support GET, POST on /analytics
 @app.get("/analytics")
 @app.post("/analytics")
 def analytics():
     total = stats["total"] or 1
     hits = stats["hits"]
     hit_rate = round(hits / total, 4)
-
     baseline_cost = round(stats["total_tokens"] * COST_PER_1M / 1_000_000, 6)
     actual_cost = round((stats["total_tokens"] - stats["cached_tokens"]) * COST_PER_1M / 1_000_000, 6)
     savings = round(baseline_cost - actual_cost, 6)
