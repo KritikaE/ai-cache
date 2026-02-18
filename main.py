@@ -1,48 +1,159 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import hashlib, time
+import hashlib, time, numpy as np
 from collections import OrderedDict
+from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
-cache = OrderedDict()
-stats = {"hits": 0, "misses": 0, "total": 0}
 
+# --- CORS FIX (this is what was causing the error) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Config ---
+MAX_SIZE = 500
+TTL = 86400
+TOKENS = 2000
+COST_PER_1M = 1.20
+SIMILARITY_THRESHOLD = 0.95
+
+# --- Storage ---
+exact_cache = OrderedDict()
+semantic_cache = []
+stats = {"hits": 0, "misses": 0, "total": 0, "cached_tokens": 0, "total_tokens": 0, "low_hit_alerts": []}
+
+# --- Helpers ---
 def normalize(text): return text.lower().strip()
 def md5(text): return hashlib.md5(text.encode()).hexdigest()
 
+def get_embedding(text):
+    chars = [ord(c) for c in text[:128]]
+    chars += [0] * (128 - len(chars))
+    vec = np.array(chars, dtype=float)
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+def find_semantic_match(embedding):
+    for entry in semantic_cache:
+        if time.time() - entry["timestamp"] > TTL:
+            continue
+        sim = cosine_similarity([embedding], [entry["embedding"]])[0][0]
+        if sim >= SIMILARITY_THRESHOLD:
+            return entry
+    return None
+
+def evict_if_needed():
+    while len(exact_cache) >= MAX_SIZE:
+        exact_cache.popitem(last=False)
+
+def fake_llm(query):
+    time.sleep(0.5)
+    return "Code review: Consider improving variable naming, adding error handling, and writing unit tests."
+
+def check_low_hit_rate():
+    total = stats["total"]
+    if total > 10:
+        hit_rate = stats["hits"] / total
+        if hit_rate < 0.10:
+            alert = f"Low hit rate alert: {round(hit_rate*100, 1)}% at {time.strftime('%H:%M:%S')}"
+            stats["low_hit_alerts"].append(alert)
+
+# --- Request Model ---
 class Query(BaseModel):
     query: str
     application: str = "code review assistant"
 
+# --- POST / ---
 @app.post("/")
 def ask(req: Query):
     start = time.time()
     stats["total"] += 1
-    key = md5(normalize(req.query))
-    if key in cache:
-        entry = cache[key]
-        if time.time() - entry["timestamp"] < 86400:
-            cache.move_to_end(key)
-            stats["hits"] += 1
-            return {"answer": entry["answer"], "cached": True,
-                    "latency": int((time.time()-start)*1000), "cacheKey": key}
-        del cache[key]
-    stats["misses"] += 1
-    answer = "Code review: Consider adding error handling and unit tests."
-    if len(cache) >= 500:
-        cache.popitem(last=False)
-    cache[key] = {"answer": answer, "timestamp": time.time()}
-    return {"answer": answer, "cached": False,
-            "latency": int((time.time()-start)*1000), "cacheKey": key}
+    stats["total_tokens"] += TOKENS
 
+    clean = normalize(req.query)
+    key = md5(clean)
+
+    # 1. Exact match
+    if key in exact_cache:
+        entry = exact_cache[key]
+        if time.time() - entry["timestamp"] < TTL:
+            exact_cache.move_to_end(key)
+            stats["hits"] += 1
+            stats["cached_tokens"] += TOKENS
+            return {
+                "answer": entry["answer"],
+                "cached": True,
+                "latency": int((time.time() - start) * 1000),
+                "cacheKey": key
+            }
+        else:
+            del exact_cache[key]
+
+    # 2. Semantic match
+    embedding = get_embedding(clean)
+    semantic_hit = find_semantic_match(embedding)
+    if semantic_hit:
+        stats["hits"] += 1
+        stats["cached_tokens"] += TOKENS
+        return {
+            "answer": semantic_hit["answer"],
+            "cached": True,
+            "latency": int((time.time() - start) * 1000),
+            "cacheKey": "semantic:" + key
+        }
+
+    # 3. Cache miss
+    stats["misses"] += 1
+    try:
+        answer = fake_llm(clean)
+    except Exception as e:
+        return {"error": str(e), "cached": False, "latency": 0, "cacheKey": key}
+
+    evict_if_needed()
+    exact_cache[key] = {"answer": answer, "timestamp": time.time()}
+    exact_cache.move_to_end(key)
+    semantic_cache.append({"embedding": embedding, "answer": answer, "timestamp": time.time()})
+
+    check_low_hit_rate()
+
+    return {
+        "answer": answer,
+        "cached": False,
+        "latency": int((time.time() - start) * 1000),
+        "cacheKey": key
+    }
+
+# --- GET /analytics ---
 @app.get("/analytics")
 def analytics():
     total = stats["total"] or 1
     hits = stats["hits"]
-    savings = round(hits * 2000 * 1.20 / 1_000_000, 4)
-    baseline = round(total * 2000 * 1.20 / 1_000_000, 4)
-    return {"hitRate": round(hits/total, 4), "totalRequests": stats["total"],
-            "cacheHits": hits, "cacheMisses": stats["misses"],
-            "cacheSize": len(cache), "costSavings": savings,
-            "savingsPercent": round(savings/baseline*100, 1),
-            "strategies": ["exact match", "semantic similarity", "LRU eviction", "TTL expiration"]}
+    hit_rate = round(hits / total, 4)
+
+    baseline_cost = round(stats["total_tokens"] * COST_PER_1M / 1_000_000, 4)
+    actual_cost = round((stats["total_tokens"] - stats["cached_tokens"]) * COST_PER_1M / 1_000_000, 4)
+    savings = round(baseline_cost - actual_cost, 4)
+    savings_pct = round((savings / baseline_cost * 100) if baseline_cost > 0 else 0, 1)
+    memory_mb = round((len(exact_cache) * 500 + len(semantic_cache) * 1024) / (1024 * 1024), 4)
+
+    return {
+        "hitRate": hit_rate,
+        "totalRequests": stats["total"],
+        "cacheHits": hits,
+        "cacheMisses": stats["misses"],
+        "cacheSize": len(exact_cache),
+        "semanticCacheSize": len(semantic_cache),
+        "memoryUsageMB": memory_mb,
+        "costSavings": savings,
+        "baselineCost": baseline_cost,
+        "actualCost": actual_cost,
+        "savingsPercent": savings_pct,
+        "lowHitRateAlerts": stats["low_hit_alerts"][-5:],
+        "strategies": ["exact match", "semantic similarity", "LRU eviction", "TTL expiration"]
+    }
