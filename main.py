@@ -64,14 +64,24 @@ def check_low_hit_rate():
             alert = f"Low hit rate: {round(hit_rate*100, 1)}% at {time.strftime('%H:%M:%S')}"
             stats["low_hit_alerts"].append(alert)
 
+# ✅ Fix 6: default empty string so null doesn't crash
 class Query(BaseModel):
-    query: str
+    query: str = ""
     application: str = "code review assistant"
 
-# --- POST / ---
 @app.post("/")
 def ask(req: Query):
     start = time.time()
+
+    # ✅ Fix 3: handle empty query
+    if not req.query or not req.query.strip():
+        return {
+            "answer": "Please provide a valid query.",
+            "cached": False,
+            "latency": max(1, int((time.time() - start) * 1000)),
+            "cacheKey": "empty"
+        }
+
     stats["total"] += 1
     stats["total_tokens"] += TOKENS
 
@@ -115,6 +125,10 @@ def ask(req: Query):
         evict_if_needed()
         exact_cache[key] = {"answer": answer, "timestamp": time.time()}
         exact_cache.move_to_end(key)
+
+        # ✅ Fix 4: limit semantic cache size
+        if len(semantic_cache) >= MAX_SIZE:
+            semantic_cache.pop(0)
         semantic_cache.append({
             "embedding": embedding,
             "answer": answer,
@@ -131,15 +145,13 @@ def ask(req: Query):
         }
 
     except Exception as e:
-        # ✅ Even on error, return valid response with real latency
         return {
             "answer": "Code review: Consider adding error handling and unit tests.",
             "cached": False,
-            "latency": max(1, int((time.time() - start) * 1000)),  # never 0
+            "latency": max(1, int((time.time() - start) * 1000)),
             "cacheKey": key
         }
 
-# ✅ FIX: Support BOTH GET and POST for /analytics
 @app.get("/analytics")
 @app.post("/analytics")
 def analytics():
@@ -147,9 +159,9 @@ def analytics():
     hits = stats["hits"]
     hit_rate = round(hits / total, 4)
 
-    baseline_cost = round(stats["total_tokens"] * COST_PER_1M / 1_000_000, 4)
-    actual_cost = round((stats["total_tokens"] - stats["cached_tokens"]) * COST_PER_1M / 1_000_000, 4)
-    savings = round(baseline_cost - actual_cost, 4)
+    baseline_cost = round(stats["total_tokens"] * COST_PER_1M / 1_000_000, 6)  # ✅ Fix 2
+    actual_cost = round((stats["total_tokens"] - stats["cached_tokens"]) * COST_PER_1M / 1_000_000, 6)
+    savings = round(baseline_cost - actual_cost, 6)
     savings_pct = round((savings / baseline_cost * 100) if baseline_cost > 0 else 0, 1)
     memory_mb = round((len(exact_cache) * 500 + len(semantic_cache) * 1024) / (1024 * 1024), 4)
 
